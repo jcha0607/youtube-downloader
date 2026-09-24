@@ -4,9 +4,46 @@ on:
   push:
     branches: [ main ]
   workflow_dispatch:
+  schedule:
+    - cron: '0 9 * * *'  # 매일 오전 9시(UTC) 체크
 
 jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      ytdlp_version: ${{ steps.check.outputs.ytdlp_version }}
+
+    steps:
+      - name: yt-dlp 최신 버전 확인
+        id: check
+        run: |
+          # PyPI에서 yt-dlp 최신 버전 가져오기
+          LATEST=$(curl -s https://pypi.org/pypi/yt-dlp/json | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])")
+          echo "최신 yt-dlp 버전: $LATEST"
+
+          # 현재 Release 태그에서 yt-dlp 버전 가져오기
+          CURRENT=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('body',''))" \
+            | grep "yt-dlp:" | awk '{print $2}' || echo "none")
+          echo "현재 빌드의 yt-dlp 버전: $CURRENT"
+
+          if [ "$LATEST" != "$CURRENT" ]; then
+            echo "새 버전 감지! 빌드 시작"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+          else
+            echo "최신 버전 유지 중. 빌드 생략"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+          echo "ytdlp_version=$LATEST" >> $GITHUB_OUTPUT
+
   build-windows:
+    needs: check-and-build
+    if: |
+      needs.check-and-build.outputs.should_build == 'true' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
 
     steps:
@@ -22,6 +59,13 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install yt-dlp imageio-ffmpeg pyinstaller
+
+      - name: yt-dlp 실제 설치 버전 확인
+        id: ytdlp_ver
+        shell: bash
+        run: |
+          VER=$(python -c "import yt_dlp; print(yt_dlp.version.__version__)")
+          echo "version=$VER" >> $GITHUB_OUTPUT
 
       - name: 버전 번호 생성 (날짜 기반)
         id: version
@@ -59,8 +103,8 @@ jobs:
             ## 다운로드
             아래 `YoutubeDownloader.exe` 파일을 클릭해서 받으세요.
 
-            ## 변경 사항
-            - yt-dlp 최신 버전 적용
+            ## 버전 정보
+            - yt-dlp: ${{ steps.ytdlp_ver.outputs.version }}
           files: dist/YoutubeDownloader.exe
           make_latest: true
         env:
