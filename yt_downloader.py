@@ -3,8 +3,19 @@ from tkinter import ttk, messagebox, filedialog
 import threading
 import os
 import queue
+import urllib.request
+import json
+import webbrowser
 import yt_dlp
 import imageio_ffmpeg
+
+# ── 버전 관리 ──────────────────────────────────────────────────────────────────
+# GitHub Actions 빌드 시 이 값이 자동으로 업데이트됩니다
+APP_VERSION = "1.0.0"
+GITHUB_USER = "jcha0607"
+GITHUB_REPO = "youtube-downloader"
+RELEASES_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
+DOWNLOAD_PAGE = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
 
 
 def get_ffmpeg_path():
@@ -12,6 +23,21 @@ def get_ffmpeg_path():
         return imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:
         return "ffmpeg"
+
+
+def check_for_update():
+    """최신 버전 확인 (백그라운드 스레드에서 호출)"""
+    try:
+        req = urllib.request.Request(
+            RELEASES_URL,
+            headers={"User-Agent": "YoutubeDownloader"}
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+            latest = data.get("tag_name", "").lstrip("v")
+            return latest
+    except Exception:
+        return None
 
 
 BG      = "#1a1a2e"
@@ -61,6 +87,53 @@ class YoutubeDownloader(tk.Tk):
 
         self._build_ui()
         self._start_worker()
+        # 앱 시작 3초 후 업데이트 체크 (UI 로딩 방해 안 되게)
+        self.after(3000, self._check_update_async)
+
+    # ── 업데이트 체크 ────────────────────────────────────────────────────────────
+    def _check_update_async(self):
+        def _check():
+            latest = check_for_update()
+            if latest and latest != APP_VERSION:
+                self.after(0, self._show_update_banner, latest)
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _show_update_banner(self, latest_version):
+        """상단에 업데이트 알림 배너 표시"""
+        banner = tk.Frame(self, bg="#2d6a4f", padx=16, pady=8)
+        # 상단 빨간 바 바로 아래에 삽입
+        banner.pack(side="top", fill="x", after=self.winfo_children()[0])
+
+        msg = tk.Label(
+            banner,
+            text=f"🔔  새 버전 {latest_version} 이 있습니다!  (현재: {APP_VERSION})",
+            font=("맑은 고딕", self._fs(11), "bold"),
+            bg="#2d6a4f", fg="white"
+        )
+        msg.pack(side="left")
+
+        def open_download():
+            webbrowser.open(DOWNLOAD_PAGE)
+
+        tk.Button(
+            banner,
+            text="  지금 업데이트  ",
+            command=open_download,
+            bg=SUCCESS, fg="#1a1a2e",
+            relief="flat", cursor="hand2",
+            font=("맑은 고딕", self._fs(10), "bold"),
+            padx=10, pady=4
+        ).pack(side="right", padx=8)
+
+        tk.Button(
+            banner,
+            text="✕",
+            command=banner.destroy,
+            bg="#2d6a4f", fg="white",
+            relief="flat", cursor="hand2",
+            font=("맑은 고딕", self._fs(10)),
+        ).pack(side="right")
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _fs(self, base):
