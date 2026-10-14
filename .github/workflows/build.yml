@@ -79,7 +79,7 @@ jobs:
       - name: 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install yt-dlp imageio-ffmpeg pyinstaller
+          pip install yt-dlp imageio-ffmpeg certifi pyinstaller
 
       - name: yt-dlp 실제 설치 버전 확인
         id: ytdlp_ver
@@ -137,7 +137,7 @@ jobs:
       - name: 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install yt-dlp imageio-ffmpeg pyinstaller
+          pip install yt-dlp imageio-ffmpeg certifi pyinstaller
 
       - name: 소스에 버전 주입
         run: |

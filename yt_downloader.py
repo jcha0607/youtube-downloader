@@ -9,6 +9,7 @@ import tempfile
 import queue
 import urllib.request
 import json
+import ssl
 import webbrowser
 import yt_dlp
 import imageio_ffmpeg
@@ -36,6 +37,15 @@ def get_ffmpeg_path():
         return "ffmpeg"
 
 
+def _ssl_context():
+    """패키징된 앱(특히 macOS)은 시스템 인증서를 못 찾아 https 접속이 실패하므로 certifi 인증서를 사용"""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def _version_tuple(v):
     try:
         return tuple(int(x) for x in v.split("."))
@@ -61,7 +71,7 @@ def check_for_update():
             RELEASES_URL,
             headers={"User-Agent": "YoutubeDownloader"}
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=5, context=_ssl_context()) as resp:
             data = json.loads(resp.read().decode())
         latest = data.get("tag_name", "").lstrip("v")
         if not latest:
@@ -103,7 +113,8 @@ def can_self_update():
 
 def download_file(url, dest, progress_cb=None):
     req = urllib.request.Request(url, headers={"User-Agent": "YoutubeDownloader"})
-    with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out:
+    with urllib.request.urlopen(req, timeout=30, context=_ssl_context()) as resp, \
+            open(dest, "wb") as out:
         total = int(resp.headers.get("Content-Length") or 0)
         done = 0
         while True:
