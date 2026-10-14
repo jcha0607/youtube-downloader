@@ -56,6 +56,9 @@ jobs:
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      ytdlp_version: ${{ steps.ytdlp_ver.outputs.version }}
 
     steps:
       - name: 코드 체크아웃
@@ -105,18 +108,112 @@ jobs:
             --collect-all imageio_ffmpeg `
             yt_downloader.py
 
+      - name: 빌드 결과 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/YoutubeDownloader.exe
+          if-no-files-found: error
+
+  build-mac:
+    needs: check-and-build
+    if: |
+      needs.check-and-build.outputs.should_build == 'true' ||
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: macos-latest
+
+    steps:
+      - name: 코드 체크아웃
+        uses: actions/checkout@v4
+
+      - name: Python 설치
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 패키지 설치
+        run: |
+          python -m pip install --upgrade pip
+          pip install yt-dlp imageio-ffmpeg pyinstaller
+
+      - name: 버전 번호 생성 (날짜 기반, Windows 빌드와 동일)
+        id: version
+        run: echo "version=$(date -u +'%Y.%m.%d')" >> $GITHUB_OUTPUT
+
+      - name: 소스에 버전 주입
+        run: |
+          python - <<'EOF'
+          with open('yt_downloader.py', 'r', encoding='utf-8') as f:
+              content = f.read()
+          content = content.replace(
+              'APP_VERSION = "1.0.0"',
+              'APP_VERSION = "${{ steps.version.outputs.version }}"'
+          )
+          with open('yt_downloader.py', 'w', encoding='utf-8') as f:
+              f.write(content)
+          EOF
+
+      - name: 앱 빌드
+        run: |
+          python -m PyInstaller \
+            --windowed \
+            --name "YoutubeDownloader" \
+            --osx-bundle-identifier com.jcha0607.youtubedownloader \
+            --collect-all yt_dlp \
+            --collect-all imageio_ffmpeg \
+            yt_downloader.py
+          # 개발자 인증서가 없으므로 ad-hoc 서명 (Apple Silicon에서 실행에 필요)
+          codesign --force --deep --sign - dist/YoutubeDownloader.app
+
+      - name: dmg 만들기
+        run: |
+          mkdir dmgroot
+          cp -R dist/YoutubeDownloader.app dmgroot/
+          ln -s /Applications dmgroot/Applications
+          hdiutil create -volname "YoutubeDownloader" \
+            -srcfolder dmgroot -ov -format UDZO YoutubeDownloader.dmg
+
+      - name: 빌드 결과 업로드
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-dmg
+          path: YoutubeDownloader.dmg
+          if-no-files-found: error
+
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: 빌드 결과 받기
+        uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+
       - name: GitHub Release 생성
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: "유튜브 다운로더 v${{ steps.version.outputs.version }}"
+          tag_name: v${{ needs.build-windows.outputs.version }}
+          name: "유튜브 다운로더 v${{ needs.build-windows.outputs.version }}"
           body: |
             ## 다운로드
-            아래 `YoutubeDownloader.exe` 파일을 클릭해서 받으세요.
+            - **Windows**: `YoutubeDownloader.exe`
+            - **Mac (Apple Silicon)**: `YoutubeDownloader.dmg` 를 열어 앱을 Applications 폴더로 끌어다 놓으세요.
+
+            ### Mac 처음 실행 시
+            개발자 인증서로 서명된 앱이 아니라서 처음 한 번은 "열 수 없음" 경고가 뜹니다.
+            앱을 **우클릭 → 열기**를 하거나, 시스템 설정 → 개인정보 보호 및 보안에서 **그래도 열기**를 누르세요.
+            이후 업데이트는 앱 안의 "지금 업데이트" 버튼으로 자동 교체되어 이 과정이 필요 없습니다.
 
             ## 버전 정보
-            - yt-dlp: ${{ steps.ytdlp_ver.outputs.version }}
-          files: dist/YoutubeDownloader.exe
+            - yt-dlp: ${{ needs.build-windows.outputs.ytdlp_version }}
+          files: |
+            out/YoutubeDownloader.exe
+            out/YoutubeDownloader.dmg
           make_latest: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

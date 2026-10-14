@@ -2,12 +2,21 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
 import os
+import sys
+import shutil
+import subprocess
+import tempfile
 import queue
 import urllib.request
 import json
 import webbrowser
 import yt_dlp
 import imageio_ffmpeg
+
+# ── 플랫폼 ─────────────────────────────────────────────────────────────────────
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+FONT = "맑은 고딕" if IS_WIN else "Apple SD Gothic Neo"
 
 # ── 버전 관리 ──────────────────────────────────────────────────────────────────
 # GitHub Actions 빌드 시 이 값이 자동으로 업데이트됩니다
@@ -16,6 +25,8 @@ GITHUB_USER = "jcha0607"
 GITHUB_REPO = "youtube-downloader"
 RELEASES_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
 DOWNLOAD_PAGE = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
+# 릴리스에 올라가는 플랫폼별 파일 이름
+ASSET_NAME = "YoutubeDownloader.exe" if IS_WIN else "YoutubeDownloader.dmg"
 
 
 def get_ffmpeg_path():
@@ -26,7 +37,10 @@ def get_ffmpeg_path():
 
 
 def check_for_update():
-    """최신 버전 확인 (백그라운드 스레드에서 호출)"""
+    """최신 버전 확인 (백그라운드 스레드에서 호출).
+
+    새 버전 정보 (버전, 이 플랫폼용 파일 URL 또는 None) 를 반환, 실패 시 None.
+    """
     try:
         req = urllib.request.Request(
             RELEASES_URL,
@@ -34,10 +48,168 @@ def check_for_update():
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-            latest = data.get("tag_name", "").lstrip("v")
-            return latest
+        latest = data.get("tag_name", "").lstrip("v")
+        if not latest:
+            return None
+        asset_url = None
+        for a in data.get("assets", []):
+            if a.get("name") == ASSET_NAME:
+                asset_url = a.get("browser_download_url")
+        return latest, asset_url
     except Exception:
         return None
+
+
+# ── 자동 업데이트 (실행 중인 앱을 같은 위치에서 새 버전으로 교체) ─────────────────────
+def install_target():
+    """지금 실행 중인 앱의 설치 경로 (Windows: exe 파일, Mac: .app 폴더).
+    소스로 직접 실행 중이면 None."""
+    if not getattr(sys, "frozen", False):
+        return None
+    exe = os.path.abspath(sys.executable)
+    if IS_WIN:
+        return exe
+    if IS_MAC:
+        p = exe
+        for _ in range(3):  # X.app/Contents/MacOS/X → X.app
+            p = os.path.dirname(p)
+        return p if p.endswith(".app") else None
+    return None
+
+
+def can_self_update():
+    target = install_target()
+    if not target:
+        return False
+    if IS_MAC and target.startswith("/Volumes/"):  # 디스크 이미지에서 바로 실행 중
+        return False
+    return os.access(os.path.dirname(target), os.W_OK)
+
+
+def download_file(url, dest, progress_cb=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "YoutubeDownloader"})
+    with urllib.request.urlopen(req, timeout=30) as resp, open(dest, "wb") as out:
+        total = int(resp.headers.get("Content-Length") or 0)
+        done = 0
+        while True:
+            chunk = resp.read(1024 * 256)
+            if not chunk:
+                break
+            out.write(chunk)
+            done += len(chunk)
+            if progress_cb and total:
+                progress_cb(done / total * 100)
+
+
+def _relaunch_env():
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"  # 새 프로세스가 이전 실행의 임시 폴더를 물려받지 않게
+    return env
+
+
+def apply_update_windows(url, target, progress_cb=None):
+    """새 exe를 같은 폴더에 받아 두고, 종료 후 배치 파일이 기존 exe 위치에 덮어쓰고 재실행"""
+    new_path = target + ".new"
+    download_file(url, new_path, progress_cb)
+    bat = os.path.join(tempfile.gettempdir(), "ytdl_update.bat")
+    script = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        "set n=0\r\n"
+        ":retry\r\n"
+        "set /a n+=1\r\n"
+        "timeout /t 1 /nobreak >nul\r\n"
+        f'move /y "{new_path}" "{target}" >nul 2>&1\r\n'
+        "if errorlevel 1 (\r\n"
+        "  if %n% lss 60 goto retry\r\n"
+        "  goto done\r\n"
+        ")\r\n"
+        f'start "" "{target}"\r\n'
+        ":done\r\n"
+        '(goto) 2>nul & del "%~f0"\r\n'
+    )
+    with open(bat, "w", encoding="utf-8", newline="") as f:
+        f.write(script)
+    subprocess.Popen(
+        ["cmd", "/c", bat],
+        creationflags=0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
+        close_fds=True, env=_relaunch_env(),
+    )
+
+
+def apply_update_mac(url, target, progress_cb=None):
+    """dmg를 받아 .app을 기존 위치 옆에 복사해 두고, 종료 후 교체하고 재실행"""
+    tmp = tempfile.mkdtemp(prefix="ytdl_update_")
+    dmg = os.path.join(tmp, ASSET_NAME)
+    mount = os.path.join(tmp, "mnt")
+    os.makedirs(mount)
+    staging = target + ".new"
+    download_file(url, dmg, progress_cb)
+    subprocess.run(
+        ["hdiutil", "attach", "-nobrowse", "-readonly", "-noverify",
+         "-mountpoint", mount, dmg],
+        check=True, capture_output=True,
+    )
+    try:
+        apps = [n for n in os.listdir(mount) if n.endswith(".app")]
+        if not apps:
+            raise RuntimeError("dmg 안에 앱이 없습니다")
+        if os.path.exists(staging):
+            shutil.rmtree(staging)
+        subprocess.run(["ditto", os.path.join(mount, apps[0]), staging],
+                       check=True, capture_output=True)
+    finally:
+        subprocess.run(["hdiutil", "detach", "-force", mount], capture_output=True)
+        shutil.rmtree(tmp, ignore_errors=True)
+    script = (
+        'while kill -0 "$1" 2>/dev/null; do sleep 0.5; done\n'
+        'rm -rf "$2" && mv "$3" "$2" || exit 1\n'
+        'xattr -dr com.apple.quarantine "$2" 2>/dev/null\n'
+        'open "$2"\n'
+    )
+    subprocess.Popen(
+        ["/bin/sh", "-c", script, "sh", str(os.getpid()), target, staging],
+        start_new_session=True, close_fds=True, env=_relaunch_env(),
+    )
+
+
+def cleanup_update_leftovers():
+    """이전 업데이트가 실패해 남은 임시 파일 정리 (실패해도 무시)"""
+    target = install_target()
+    if not target:
+        return
+    leftover = target + ".new"
+    try:
+        if os.path.isdir(leftover):
+            shutil.rmtree(leftover)
+        elif os.path.exists(leftover):
+            os.remove(leftover)
+    except Exception:
+        pass
+
+
+def make_button(parent, text, command, bg, fg, abg=None, afg="white",
+                font=None, padx=0, pady=0, **kw):
+    """Windows는 일반 버튼. macOS의 Tk 버튼은 배경색이 안 먹어서 라벨로 버튼을 흉내."""
+    abg = abg or "#e94560"
+    if not IS_MAC:
+        return tk.Button(
+            parent, text=text, command=command, bg=bg, fg=fg,
+            activebackground=abg, activeforeground=afg,
+            relief="flat", cursor="hand2", font=font,
+            padx=padx, pady=pady, **kw
+        )
+    lbl = tk.Label(parent, text=text, bg=bg, fg=fg, font=font,
+                   padx=padx, pady=pady, cursor="pointinghand", **kw)
+    lbl.bind("<ButtonPress-1>", lambda e: lbl.config(bg=abg, fg=afg))
+
+    def _release(e):
+        lbl.config(bg=bg, fg=fg)
+        if 0 <= e.x < lbl.winfo_width() and 0 <= e.y < lbl.winfo_height():
+            command()
+
+    lbl.bind("<ButtonRelease-1>", _release)
+    return lbl
 
 
 BG      = "#1a1a2e"
@@ -85,6 +257,7 @@ class YoutubeDownloader(tk.Tk):
         self.queue_items = []          # list of (url, fmt) for display
         self._is_downloading = False
 
+        cleanup_update_leftovers()
         self._build_ui()
         self._start_worker()
         # 앱 시작 3초 후 업데이트 체크 (UI 로딩 방해 안 되게)
@@ -93,13 +266,13 @@ class YoutubeDownloader(tk.Tk):
     # ── 업데이트 체크 ────────────────────────────────────────────────────────────
     def _check_update_async(self):
         def _check():
-            latest = check_for_update()
-            if latest and latest != APP_VERSION:
-                self.after(0, self._show_update_banner, latest)
+            info = check_for_update()
+            if info and info[0] != APP_VERSION:
+                self.after(0, self._show_update_banner, *info)
 
         threading.Thread(target=_check, daemon=True).start()
 
-    def _show_update_banner(self, latest_version):
+    def _show_update_banner(self, latest_version, asset_url=None):
         """상단에 업데이트 알림 배너 표시"""
         banner = tk.Frame(self, bg="#2d6a4f", padx=16, pady=8)
         # 상단 빨간 바 바로 아래에 삽입
@@ -108,47 +281,71 @@ class YoutubeDownloader(tk.Tk):
         msg = tk.Label(
             banner,
             text=f"🔔  새 버전 {latest_version} 이 있습니다!  (현재: {APP_VERSION})",
-            font=("맑은 고딕", self._fs(11), "bold"),
+            font=(FONT, self._fs(11), "bold"),
             bg="#2d6a4f", fg="white"
         )
         msg.pack(side="left")
 
-        def open_download():
+        def on_update():
+            if asset_url and can_self_update():
+                self._start_self_update(asset_url, banner, msg, update_btn)
+            else:
+                webbrowser.open(DOWNLOAD_PAGE)
+
+        update_btn = make_button(
+            banner, "  지금 업데이트  ", on_update,
+            bg=SUCCESS, fg="#1a1a2e", abg="#3aa88a", afg="#1a1a2e",
+            font=(FONT, self._fs(10), "bold"), padx=10, pady=4
+        )
+        update_btn.pack(side="right", padx=8)
+
+        close_btn = make_button(
+            banner, "✕", banner.destroy,
+            bg="#2d6a4f", fg="white", abg="#245a41",
+            font=(FONT, self._fs(10)), padx=6
+        )
+        close_btn.pack(side="right")
+
+    def _start_self_update(self, url, banner, msg, btn):
+        """새 버전을 받아 지금 설치된 위치에 덮어쓰고 재시작"""
+        if self._is_downloading and not messagebox.askyesno(
+            "업데이트", "다운로드가 진행 중입니다.\n업데이트하면 중단됩니다. 계속할까요?"
+        ):
+            return
+        btn.pack_forget()
+        msg.config(text="⬇  업데이트 받는 중... 0%")
+        apply = apply_update_windows if IS_WIN else apply_update_mac
+        target = install_target()
+
+        def progress(pct):
+            self.after(0, lambda: msg.config(text=f"⬇  업데이트 받는 중... {int(pct)}%"))
+
+        def work():
+            try:
+                apply(url, target, progress)
+            except Exception:
+                self.after(0, fail)
+                return
+            self.after(0, lambda: msg.config(text="🔄  재시작 중..."))
+            self.after(300, lambda: os._exit(0))
+
+        def fail():
+            msg.config(text="업데이트에 실패했습니다. 다운로드 페이지에서 직접 받아주세요.")
             webbrowser.open(DOWNLOAD_PAGE)
 
-        tk.Button(
-            banner,
-            text="  지금 업데이트  ",
-            command=open_download,
-            bg=SUCCESS, fg="#1a1a2e",
-            relief="flat", cursor="hand2",
-            font=("맑은 고딕", self._fs(10), "bold"),
-            padx=10, pady=4
-        ).pack(side="right", padx=8)
-
-        tk.Button(
-            banner,
-            text="✕",
-            command=banner.destroy,
-            bg="#2d6a4f", fg="white",
-            relief="flat", cursor="hand2",
-            font=("맑은 고딕", self._fs(10)),
-        ).pack(side="right")
+        threading.Thread(target=work, daemon=True).start()
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _fs(self, base):
         return max(8, int(base * self._scale))
 
     def _btn(self, parent, text, cmd, bg=None, fg=TEXT, **kw):
-        b = tk.Button(
-            parent, text=text, command=cmd,
-            bg=bg or ACCENT2, fg=fg,
-            activebackground=ACCENT, activeforeground="white",
-            relief="flat", cursor="hand2",
-            font=("맑은 고딕", self._fs(11), "bold"),
+        return make_button(
+            parent, text, cmd,
+            bg=bg or ACCENT2, fg=fg, abg=ACCENT,
+            font=(FONT, self._fs(11), "bold"),
             **kw
         )
-        return b
 
     # ── UI build ─────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -187,14 +384,15 @@ class YoutubeDownloader(tk.Tk):
             "<Configure>",
             lambda e: self._canvas.itemconfig(self._inner_id, width=e.width)
         )
-        self._canvas.bind_all(
-            "<MouseWheel>",
-            lambda e: self._canvas.yview_scroll(
-                int(-1 * (e.delta / 120)), "units"
-            )
-        )
+        self._canvas.bind_all("<MouseWheel>", self._on_mousewheel)
 
         self._build_content(self._inner)
+
+    def _on_mousewheel(self, e):
+        # Windows는 한 칸에 delta 120, macOS는 이미 작은 정수 단위
+        step = int(-1 * (e.delta / 120)) if IS_WIN else -e.delta
+        if step:
+            self._canvas.yview_scroll(step, "units")
 
     def _build_progress_panel(self):
         """항상 보이는 하단 고정 패널"""
@@ -209,14 +407,14 @@ class YoutubeDownloader(tk.Tk):
 
         self.status_label = tk.Label(
             row, textvariable=self.status_var,
-            font=("맑은 고딕", self._fs(11)),
+            font=(FONT, self._fs(11)),
             bg=PANEL, fg=MUTED, anchor="w"
         )
         self.status_label.pack(side="left", fill="x", expand=True)
 
         self.pct_label = tk.Label(
             row, textvariable=self.pct_var,
-            font=("맑은 고딕", self._fs(16), "bold"),
+            font=(FONT, self._fs(16), "bold"),
             bg=PANEL, fg=ACCENT
         )
         self.pct_label.pack(side="right")
@@ -242,13 +440,13 @@ class YoutubeDownloader(tk.Tk):
         # ── title ──
         tk.Label(
             parent, text="유튜브 다운로더",
-            font=("맑은 고딕", self._fs(22), "bold"),
+            font=(FONT, self._fs(22), "bold"),
             bg=BG, fg=TEXT
         ).pack(pady=(pad, 4))
 
         tk.Label(
             parent, text="URL을 붙여넣고 화질을 선택하세요",
-            font=("맑은 고딕", self._fs(11)),
+            font=(FONT, self._fs(11)),
             bg=BG, fg=MUTED
         ).pack(pady=4)
 
@@ -261,7 +459,7 @@ class YoutubeDownloader(tk.Tk):
 
         tk.Label(
             url_frame, text="YouTube URL",
-            font=("맑은 고딕", self._fs(10), "bold"),
+            font=(FONT, self._fs(10), "bold"),
             bg=PANEL, fg=MUTED
         ).pack(anchor="w")
 
@@ -270,7 +468,7 @@ class YoutubeDownloader(tk.Tk):
 
         self.url_entry = tk.Entry(
             entry_row,
-            font=("맑은 고딕", self._fs(12)),
+            font=(FONT, self._fs(12)),
             bg=ACCENT2, fg=MUTED,
             insertbackground=TEXT,
             relief="flat", bd=8
@@ -288,7 +486,7 @@ class YoutubeDownloader(tk.Tk):
 
         tk.Label(
             fmt_frame, text="화질 / 형식",
-            font=("맑은 고딕", self._fs(10), "bold"),
+            font=(FONT, self._fs(10), "bold"),
             bg=BG, fg=MUTED
         ).pack(anchor="w", pady=4)
 
@@ -302,7 +500,7 @@ class YoutubeDownloader(tk.Tk):
 
         tk.Label(
             folder_frame, text="저장 위치",
-            font=("맑은 고딕", self._fs(10), "bold"),
+            font=(FONT, self._fs(10), "bold"),
             bg=PANEL, fg=MUTED
         ).pack(anchor="w")
 
@@ -311,7 +509,7 @@ class YoutubeDownloader(tk.Tk):
 
         self.folder_label = tk.Label(
             folder_row, textvariable=self.save_dir,
-            font=("맑은 고딕", self._fs(10)),
+            font=(FONT, self._fs(10)),
             bg=PANEL, fg=TEXT, anchor="w"
         )
         self.folder_label.pack(side="left", fill="x", expand=True)
@@ -341,13 +539,13 @@ class YoutubeDownloader(tk.Tk):
 
         tk.Label(
             hdr, text="다운로드 대기열",
-            font=("맑은 고딕", self._fs(11), "bold"),
+            font=(FONT, self._fs(11), "bold"),
             bg=PANEL, fg=TEXT
         ).pack(side="left")
 
         self.queue_count_label = tk.Label(
             hdr, text="(0개)",
-            font=("맑은 고딕", self._fs(10)),
+            font=(FONT, self._fs(10)),
             bg=PANEL, fg=MUTED
         )
         self.queue_count_label.pack(side="left", padx=6)
@@ -378,17 +576,14 @@ class YoutubeDownloader(tk.Tk):
                 row_frame.pack(fill="x", pady=2)
 
             btn_text = ("✔  " + label) if selected else label
-            btn = tk.Button(
-                row_frame,
-                text=btn_text,
+            btn = make_button(
+                row_frame, btn_text,
+                lambda k=key: self._select_format(k),
                 bg=ACCENT if selected else ACCENT2,
                 fg="white" if selected else MUTED,
-                activebackground=ACCENT,
-                activeforeground="white",
-                relief="flat", cursor="hand2",
-                font=("맑은 고딕", self._fs(11), "bold" if selected else "normal"),
-                padx=10, pady=8,
-                command=lambda k=key: self._select_format(k)
+                abg=ACCENT,
+                font=(FONT, self._fs(11), "bold" if selected else "normal"),
+                padx=10, pady=8
             )
             btn.pack(side="left", padx=3, expand=True, fill="x")
 
@@ -447,7 +642,7 @@ class YoutubeDownloader(tk.Tk):
             tk.Label(
                 self.queue_list_frame,
                 text="대기 중인 항목 없음",
-                font=("맑은 고딕", self._fs(10)),
+                font=(FONT, self._fs(10)),
                 bg=PANEL, fg=MUTED
             ).pack(pady=8)
             return
@@ -459,7 +654,7 @@ class YoutubeDownloader(tk.Tk):
             num_label = tk.Label(
                 item_frame,
                 text=f"{i+1}.",
-                font=("맑은 고딕", self._fs(10), "bold"),
+                font=(FONT, self._fs(10), "bold"),
                 bg=ACCENT2, fg=ACCENT, width=3, anchor="w"
             )
             num_label.pack(side="left")
@@ -468,14 +663,14 @@ class YoutubeDownloader(tk.Tk):
             tk.Label(
                 item_frame,
                 text=short_url,
-                font=("맑은 고딕", self._fs(9)),
+                font=(FONT, self._fs(9)),
                 bg=ACCENT2, fg=TEXT, anchor="w"
             ).pack(side="left", fill="x", expand=True)
 
             tk.Label(
                 item_frame,
                 text=FORMAT_LABELS.get(fmt, fmt),
-                font=("맑은 고딕", self._fs(9)),
+                font=(FONT, self._fs(9)),
                 bg=ACCENT2, fg=MUTED
             ).pack(side="right")
 
