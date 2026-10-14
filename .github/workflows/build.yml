@@ -10,11 +10,22 @@ on:
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write  # 워크플로 활성화 API 호출용 (60일 비활동 비활성화 방지)
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       ytdlp_version: ${{ steps.check.outputs.ytdlp_version }}
 
     steps:
+      - name: 예약 워크플로 비활성화 방지 (60일 타이머 초기화)
+        if: github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X PUT \
+            "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
+
       - name: yt-dlp 최신 버전 확인
         id: check
         run: |
