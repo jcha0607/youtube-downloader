@@ -260,7 +260,7 @@ PLACEHOLDER = "https://www.youtube.com/watch?v=..."
 class YoutubeDownloader(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("유튜브 다운로더")
+        self.title(f"유튜브 다운로더  v{APP_VERSION}")
         self.resizable(True, True)
         self.configure(bg=BG)
         self.minsize(480, 400)
