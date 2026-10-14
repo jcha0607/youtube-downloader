@@ -716,35 +716,43 @@ class YoutubeDownloader(tk.Tk):
     def _download(self, url, fmt, save_dir):
         ffmpeg = get_ffmpeg_path()
 
-        if fmt == "mp3":
-            ydl_opts = {
-                "format": "bestaudio/best",
+        def make_opts(hls_first):
+            common = {
                 "outtmpl": os.path.join(save_dir, "%(title)s.%(ext)s"),
                 "ffmpeg_location": ffmpeg,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
                 "progress_hooks": [self._progress_hook],
+                "retries": 10,
+                "fragment_retries": 10,
             }
-        else:
+            if fmt == "mp3":
+                return {
+                    **common,
+                    "format": "bestaudio/best",
+                    "postprocessors": [{
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }],
+                }
             if fmt == "video_best":
-                fmt_str = "bestvideo+bestaudio/best"
+                limit, tail = "", "bestvideo+bestaudio/best"
             else:
-                fmt_str = (
-                    f"bestvideo[height<={fmt}]+bestaudio/best[height<={fmt}]/best"
-                )
-            ydl_opts = {
-                "format": fmt_str,
-                "outtmpl": os.path.join(save_dir, "%(title)s.%(ext)s"),
-                "ffmpeg_location": ffmpeg,
-                "merge_output_format": "mp4",
-                "progress_hooks": [self._progress_hook],
-            }
+                limit = f"[height<={fmt}]"
+                tail = f"bestvideo{limit}+bestaudio/best{limit}/best"
+            # 일부 직접 주소(https) 형식이 간헐적으로 403이 나서, 마지막 재시도에서는 HLS 형식을 먼저 시도
+            fmt_str = f"bestvideo{limit}[protocol^=m3u8]+bestaudio/{tail}" if hls_first else tail
+            return {**common, "format": fmt_str, "merge_output_format": "mp4"}
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
+        # 유튜브가 간헐적으로 403(Forbidden)을 주므로, 새 주소를 받아 다시 시도 → 그래도 안 되면 HLS 형식
+        for attempt in range(3):
+            try:
+                with yt_dlp.YoutubeDL(make_opts(hls_first=(attempt == 2))) as ydl:
+                    ydl.download([url])
+                return
+            except yt_dlp.utils.DownloadError as e:
+                if "403" not in str(e) or attempt == 2:
+                    raise
+                self.after(0, self.status_var.set, "접근이 거부되어 다시 시도하는 중...")
 
     def _progress_hook(self, d):
         if d["status"] == "downloading":
