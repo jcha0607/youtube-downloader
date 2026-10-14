@@ -7,6 +7,9 @@ on:
   schedule:
     - cron: '0 9 * * *'  # 매일 오전 9시(UTC) 체크
 
+env:
+  VERSION_BASE: "1.0"  # 큰 변경 때 직접 올리세요 (예: 1.1). 뒤의 번호는 빌드마다 자동 증가
+
 jobs:
   check-and-build:
     runs-on: ubuntu-latest
@@ -15,6 +18,7 @@ jobs:
       actions: write  # 워크플로 활성화 API 호출용 (60일 비활동 비활성화 방지)
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
+      version: ${{ steps.ver.outputs.version }}
       ytdlp_version: ${{ steps.check.outputs.ytdlp_version }}
 
     steps:
@@ -25,6 +29,10 @@ jobs:
         run: |
           gh api -X PUT \
             "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
+
+      - name: 앱 버전 번호 생성 (기준값.빌드번호)
+        id: ver
+        run: echo "version=${VERSION_BASE}.${{ github.run_number }}" >> $GITHUB_OUTPUT
 
       - name: yt-dlp 최신 버전 확인
         id: check
@@ -57,7 +65,6 @@ jobs:
       github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     outputs:
-      version: ${{ steps.version.outputs.version }}
       ytdlp_version: ${{ steps.ytdlp_ver.outputs.version }}
 
     steps:
@@ -81,11 +88,6 @@ jobs:
           VER=$(python -c "import yt_dlp; print(yt_dlp.version.__version__)")
           echo "version=$VER" >> $GITHUB_OUTPUT
 
-      - name: 버전 번호 생성 (날짜 기반)
-        id: version
-        shell: bash
-        run: echo "version=$(date +'%Y.%m.%d')" >> $GITHUB_OUTPUT
-
       - name: 소스에 버전 주입
         shell: python
         run: |
@@ -93,7 +95,7 @@ jobs:
               content = f.read()
           content = content.replace(
               'APP_VERSION = "1.0.0"',
-              'APP_VERSION = "${{ steps.version.outputs.version }}"'
+              'APP_VERSION = "${{ needs.check-and-build.outputs.version }}"'
           )
           with open('yt_downloader.py', 'w', encoding='utf-8') as f:
               f.write(content)
@@ -137,10 +139,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install yt-dlp imageio-ffmpeg pyinstaller
 
-      - name: 버전 번호 생성 (날짜 기반, Windows 빌드와 동일)
-        id: version
-        run: echo "version=$(date -u +'%Y.%m.%d')" >> $GITHUB_OUTPUT
-
       - name: 소스에 버전 주입
         run: |
           python - <<'EOF'
@@ -148,7 +146,7 @@ jobs:
               content = f.read()
           content = content.replace(
               'APP_VERSION = "1.0.0"',
-              'APP_VERSION = "${{ steps.version.outputs.version }}"'
+              'APP_VERSION = "${{ needs.check-and-build.outputs.version }}"'
           )
           with open('yt_downloader.py', 'w', encoding='utf-8') as f:
               f.write(content)
@@ -182,7 +180,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [build-windows, build-mac]
+    needs: [check-and-build, build-windows, build-mac]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -197,8 +195,8 @@ jobs:
       - name: GitHub Release 생성
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ needs.build-windows.outputs.version }}
-          name: "유튜브 다운로더 v${{ needs.build-windows.outputs.version }}"
+          tag_name: v${{ needs.check-and-build.outputs.version }}
+          name: "유튜브 다운로더 v${{ needs.check-and-build.outputs.version }}"
           body: |
             ## 다운로드
             - **Windows**: `YoutubeDownloader.exe`

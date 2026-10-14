@@ -36,6 +36,21 @@ def get_ffmpeg_path():
         return "ffmpeg"
 
 
+def _version_tuple(v):
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return (0,)
+
+
+def _is_newer(latest, current):
+    """숫자 단위로 비교 (1.0.10 > 1.0.9). 형식이 달라 비교 불가면 값이 다를 때만 새 버전으로 취급"""
+    a, b = _version_tuple(latest), _version_tuple(current)
+    if a == (0,) or b == (0,):
+        return latest != current
+    return a > b
+
+
 def check_for_update():
     """최신 버전 확인 (백그라운드 스레드에서 호출).
 
@@ -267,7 +282,7 @@ class YoutubeDownloader(tk.Tk):
     def _check_update_async(self):
         def _check():
             info = check_for_update()
-            if info and info[0] != APP_VERSION:
+            if info and _is_newer(info[0], APP_VERSION):
                 self.after(0, self._show_update_banner, *info)
 
         threading.Thread(target=_check, daemon=True).start()
