@@ -284,7 +284,10 @@ class YoutubeDownloader(tk.Tk):
         self._is_downloading = False
 
         cleanup_update_leftovers()
+        self._update_banner = None     # 현재 떠 있는 업데이트 배너
+        self._update_action = None     # 배너의 "지금 업데이트" 동작
         self._build_ui()
+        self._build_menu()
         self._start_worker()
         # 앱 시작 3초 후 업데이트 체크 (UI 로딩 방해 안 되게)
         self.after(3000, self._check_update_async)
@@ -298,11 +301,64 @@ class YoutubeDownloader(tk.Tk):
 
         threading.Thread(target=_check, daemon=True).start()
 
+    # ── 메뉴바 ───────────────────────────────────────────────────────────────────
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        if IS_MAC:
+            # macOS는 앱 이름 메뉴(맨 왼쪽)에 "업데이트 확인"을 두는 것이 관례
+            app_menu = tk.Menu(menubar, name="apple")
+            menubar.add_cascade(menu=app_menu)
+            app_menu.add_command(label="업데이트 확인...", command=self._menu_check_update)
+            self.createcommand("tkAboutDialog", self._show_about)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="업데이트 확인...", command=self._menu_check_update)
+        help_menu.add_separator()
+        help_menu.add_command(label="버전 정보", command=self._show_about)
+        menubar.add_cascade(label="도움말", menu=help_menu)
+        self.config(menu=menubar)
+
+    def _show_about(self):
+        messagebox.showinfo("버전 정보", f"유튜브 다운로더\n현재 버전: v{APP_VERSION}")
+
+    def _menu_check_update(self):
+        """메뉴에서 직접 업데이트 확인 (결과를 항상 알려줌)"""
+        if not self._is_downloading:
+            self.status_var.set("업데이트 확인 중...")
+
+        def _check():
+            info = check_for_update()
+            self.after(0, self._on_manual_check, info)
+
+        threading.Thread(target=_check, daemon=True).start()
+
+    def _on_manual_check(self, info):
+        if not self._is_downloading:
+            self.status_var.set("준비됨")
+        if info is None:
+            messagebox.showerror(
+                "업데이트 확인", "업데이트 정보를 가져오지 못했습니다.\n인터넷 연결을 확인해 주세요."
+            )
+            return
+        latest, asset_url = info
+        if not _is_newer(latest, APP_VERSION):
+            messagebox.showinfo("업데이트 확인", f"최신 버전입니다.  (v{APP_VERSION})")
+            return
+        self._show_update_banner(latest, asset_url)
+        if messagebox.askyesno(
+            "업데이트 확인",
+            f"새 버전 {latest} 이 있습니다.  (현재: {APP_VERSION})\n\n지금 업데이트할까요?"
+        ):
+            if self._update_action:
+                self._update_action()
+
     def _show_update_banner(self, latest_version, asset_url=None):
         """상단에 업데이트 알림 배너 표시"""
+        if self._update_banner is not None and self._update_banner.winfo_exists():
+            return
         banner = tk.Frame(self, bg="#2d6a4f", padx=16, pady=8)
         # 상단 빨간 바 바로 아래에 삽입
-        banner.pack(side="top", fill="x", after=self.winfo_children()[0])
+        banner.pack(side="top", fill="x", after=self._top_bar)
+        self._update_banner = banner
 
         msg = tk.Label(
             banner,
@@ -324,6 +380,7 @@ class YoutubeDownloader(tk.Tk):
             font=(FONT, self._fs(10), "bold"), padx=10, pady=4
         )
         update_btn.pack(side="right", padx=8)
+        self._update_action = on_update
 
         close_btn = make_button(
             banner, "✕", banner.destroy,
@@ -376,7 +433,8 @@ class YoutubeDownloader(tk.Tk):
     # ── UI build ─────────────────────────────────────────────────────────────
     def _build_ui(self):
         # top accent bar
-        tk.Frame(self, bg=ACCENT, height=6).pack(side="top", fill="x")
+        self._top_bar = tk.Frame(self, bg=ACCENT, height=6)
+        self._top_bar.pack(side="top", fill="x")
 
         # FIXED bottom progress panel (pack before scroll area)
         self._build_progress_panel()
