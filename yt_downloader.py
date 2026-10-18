@@ -1,6 +1,7 @@
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading
+import time
 import os
 import sys
 import shutil
@@ -28,6 +29,230 @@ RELEASES_URL = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}/releas
 DOWNLOAD_PAGE = f"https://github.com/{GITHUB_USER}/{GITHUB_REPO}/releases/latest"
 # 릴리스에 올라가는 플랫폼별 파일 이름
 ASSET_NAME = "YoutubeDownloader.exe" if IS_WIN else "YoutubeDownloader.dmg"
+
+
+def get_js_runtimes():
+    """유튜브 주소 해독용 JS 런타임(QuickJS). 앱에 같이 들어 있으면 그걸 쓰고, 없으면 yt-dlp 기본값(PATH의 deno)"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base, "qjs.exe" if IS_WIN else "qjs")
+    if os.path.exists(path):
+        return {"quickjs": {"path": path}}
+    return None
+
+
+# ── 화질 / 음질 선택 ────────────────────────────────────────────────────────────
+TIER_STEPS = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320]
+
+
+def _tier_of(f):
+    """형식의 화질 단계(짧은 변 기준). 3840x1920 → 2160(4K), 1080x1920 세로 영상 → 1080"""
+    h, w = f.get("height") or 0, f.get("width") or 0
+    side = min(h, w) if (h and w) else (h or w)
+    for t in TIER_STEPS:
+        if side <= t:
+            return t
+    return TIER_STEPS[-1]
+
+
+def _is_hls(f):
+    return str(f.get("protocol") or "").startswith("m3u8")
+
+
+def _size_of(f, duration):
+    n = f.get("filesize") or f.get("filesize_approx")
+    if n:
+        return int(n)
+    tbr = f.get("tbr") or f.get("vbr") or f.get("abr")
+    if tbr and duration:
+        return int(tbr * 1000 / 8 * duration)
+    return None
+
+
+MP3_BITRATES = [32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320]
+
+
+def _mp3_bitrate(abr):
+    """원본 오디오의 비트레이트와 가장 가까운 표준 MP3 비트레이트 (MP3는 임의 값을 못 씀)"""
+    if not abr:
+        return 128
+    return min(MP3_BITRATES, key=lambda b: abs(b - abr))
+
+
+def _mp3_post(bitrate):
+    return {"postprocessors": [{
+        "key": "FFmpegExtractAudio",
+        "preferredcodec": "mp3",
+        "preferredquality": str(bitrate),
+    }]}
+
+
+def _fmt_size(n):
+    mb = n / 1024 / 1024
+    if mb >= 1024:
+        return f"{mb / 1024:.1f}GB"
+    return f"{mb:.0f}MB" if mb >= 10 else f"{mb:.1f}MB"
+
+
+def _fmt_duration(sec):
+    if not sec:
+        return ""
+    sec = int(sec)
+    h, m, s = sec // 3600, sec % 3600 // 60, sec % 60
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def legacy_spec(key, hls_first=False):
+    """영상 정보를 못 읽었을 때(재생목록 등) 쓰는 예전 방식의 형식 지정"""
+    if key == "audio_orig":
+        return "bestaudio/best", {}
+    if key == "audio_mp3":
+        return "bestaudio/best", _mp3_post(128)
+    limit = "" if key == "video_best" else f"[height<={key}]"
+    tail = "bestvideo+bestaudio/best" if not limit else \
+        f"bestvideo{limit}+bestaudio/best{limit}/best"
+    # 일부 직접 주소(https) 형식이 간헐적으로 403이 나서, 마지막 재시도에서는 HLS 형식을 먼저 시도
+    sel = f"bestvideo{limit}[protocol^=m3u8]+bestaudio/{tail}" if hls_first else tail
+    return sel, {"merge_output_format": "mp4"}
+
+
+class FormatPlan:
+    """영상 정보에서 선택 가능한 화질/음질, 예상 용량, 실제 받을 형식을 계산"""
+
+    def __init__(self, info):
+        self.title = info.get("title") or ""
+        self.duration = info.get("duration")
+        fmts = info.get("formats") or []
+
+        vids = [f for f in fmts
+                if f.get("vcodec") not in (None, "none") and f.get("ext") != "mhtml"
+                and (f.get("height") or f.get("width"))]
+        video_only = [f for f in vids if f.get("acodec") in (None, "none")]
+        self.muxed = not video_only            # 영상+음성이 합쳐진 형식뿐인 경우
+        self.tiers = {}
+        for f in (video_only or vids):
+            self.tiers.setdefault(_tier_of(f), []).append(f)
+        for lst in self.tiers.values():        # 직접 주소(https) 먼저, 그 안에서 비트레이트 높은 순
+            lst.sort(key=lambda f: (not _is_hls(f), f.get("tbr") or 0), reverse=True)
+
+        auds = [f for f in fmts
+                if f.get("acodec") not in (None, "none") and f.get("vcodec") in (None, "none")
+                and "DRC" not in str(f.get("format_note") or "")]
+        auds.sort(key=lambda f: (f.get("language_preference") or -1,
+                                 f.get("abr") or f.get("tbr") or 0), reverse=True)
+        self.audios = auds
+
+        def abr(f):
+            return f.get("abr") or f.get("tbr") or 0
+
+        # 가장 좋은 음질. 음질이 거의 같으면(10% 이내) 어느 기기에서나 재생되는 m4a를 우선
+        best = auds[0] if auds else None
+        if best and best.get("ext") != "m4a":
+            for g in auds:
+                if (g.get("ext") == "m4a" and abr(best) * 0.9 <= abr(g) <= abr(best) * 1.1
+                        and g.get("language_preference") == best.get("language_preference")):
+                    best = g
+                    break
+        self.audio = best
+
+    def best_tier(self):
+        return max(self.tiers) if self.tiers else None
+
+    def _video_size(self, tier):
+        v = _size_of(self.tiers[tier][0], self.duration)
+        if v is None:
+            return None
+        if not self.muxed and self.audios:
+            v += _size_of(self.audios[0], self.duration) or 0
+        return v
+
+    def option(self, key):
+        """(선택 가능 여부, 버튼에 보여줄 부가 설명)"""
+        if key in ("audio_orig", "audio_mp3"):
+            f = self.audio
+            if not f:
+                return False, "없음"
+            abr = f.get("abr") or f.get("tbr") or 0
+            if key == "audio_orig":
+                text = f"{f.get('ext')} · {int(round(abr))}kbps"
+                size = _size_of(f, self.duration)
+            else:
+                br = _mp3_bitrate(abr)
+                text = f"mp3 · {br}kbps"
+                size = br * 1000 / 8 * self.duration if self.duration else None
+            if size:
+                text += f" · 약 {_fmt_size(size)}"
+            return True, text
+        tier = self.best_tier() if key == "video_best" else int(key)
+        if tier not in self.tiers:
+            return False, "없음"
+        size = self._video_size(tier)
+        parts = []
+        if key == "video_best":
+            parts.append(f"{tier}p")
+        if size:
+            parts.append(f"약 {_fmt_size(size)}")
+        return True, " · ".join(parts)
+
+    def download_spec(self, key, hls_first=False):
+        """(yt-dlp 형식 문자열, 추가 옵션)"""
+        if key in ("audio_orig", "audio_mp3"):
+            f = self.audio
+            if not f:
+                return legacy_spec(key)
+            if key == "audio_orig":    # 변환 없이 원본 그대로
+                return f["format_id"], {}
+            # MP3: 원본 비트레이트를 그대로 가져가고 파일 형식만 mp3로
+            return f["format_id"], _mp3_post(_mp3_bitrate(f.get("abr") or f.get("tbr")))
+        if key == "video_best" or int(key) in self.tiers:
+            tier = self.best_tier() if key == "video_best" else int(key)
+        else:   # 그 화질이 없으면 가장 가까운 낮은 화질로
+            lower = [t for t in self.tiers if t <= int(key)]
+            tier = max(lower) if lower else self.best_tier()
+        cands = self.tiers[tier]
+        https = [f for f in cands if not _is_hls(f)]
+        hls = [f for f in cands if _is_hls(f)]
+        order = hls + https if hls_first else https + hls
+        with_audio = not self.muxed and bool(self.audios)
+        sel = "/".join(f"{f['format_id']}+bestaudio" if with_audio else f["format_id"]
+                       for f in order)
+        return sel, {"merge_output_format": "mp4"}
+
+
+def _is_degraded(info):
+    """유튜브가 가끔 영상+음성이 합쳐진 저화질 형식 몇 개만 돌려준다. 분리된 영상/음성 형식이 없으면 그런 응답으로 본다"""
+    if info.get("_type") == "playlist":
+        return False
+    fm = [f for f in (info.get("formats") or []) if f.get("ext") != "mhtml"]
+    return not any((f.get("vcodec") in (None, "none")) != (f.get("acodec") in (None, "none"))
+                   for f in fm)
+
+
+def fetch_info(url, tries=3):
+    """영상 정보 읽기 (다운로드 없이). 재생목록 링크가 섞여 있어도 영상 1개만 본다.
+    형식이 부실한 응답이 오면 몇 번 다시 읽어 가장 형식이 많은 결과를 쓴다"""
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True,
+            "ignore_no_formats_error": True, "skip_download": True}
+    js = get_js_runtimes()
+    if js:
+        opts["js_runtimes"] = js
+    best = None
+    for i in range(tries):
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+        if best is None or len(info.get("formats") or []) > len(best.get("formats") or []):
+            best = info
+        if not _is_degraded(info):
+            break
+        time.sleep(1)
+    return best
+
+
+def plan_from_info(info):
+    """읽은 정보로 FormatPlan을 만들 수 없으면(재생목록 등) None"""
+    if not info or info.get("_type") == "playlist" or not info.get("formats"):
+        return None
+    plan = FormatPlan(info)
+    return plan if (plan.tiers or plan.audios) else None
 
 
 def get_ffmpeg_path():
@@ -215,9 +440,13 @@ def cleanup_update_leftovers():
 
 
 def make_button(parent, text, command, bg, fg, abg=None, afg="white",
-                font=None, padx=0, pady=0, **kw):
-    """Windows는 일반 버튼. macOS의 Tk 버튼은 배경색이 안 먹어서 라벨로 버튼을 흉내."""
+                font=None, padx=0, pady=0, disabled=False, **kw):
+    """Windows는 일반 버튼. macOS의 Tk 버튼은 배경색이 안 먹어서 라벨로 버튼을 흉내.
+    disabled=True면 눌러도 아무 일도 일어나지 않는다."""
     abg = abg or "#e94560"
+    if disabled:
+        return tk.Label(parent, text=text, bg=bg, fg=fg, font=font,
+                        padx=padx, pady=pady, **kw)
     if not IS_MAC:
         return tk.Button(
             parent, text=text, command=command, bg=bg, fg=fg,
@@ -248,10 +477,13 @@ SUCCESS = "#4ecca3"
 
 FORMAT_LABELS = {
     "video_best": "최고 화질",
+    "2160":       "4K",
+    "1440":       "2K",
     "1080":       "1080p",
     "720":        "720p",
     "480":        "480p",
-    "mp3":        "MP3 (음악)",
+    "audio_orig": "오디오: 원본",
+    "audio_mp3":  "오디오: MP3",
 }
 
 PLACEHOLDER = "https://www.youtube.com/watch?v=..."
@@ -282,12 +514,17 @@ class YoutubeDownloader(tk.Tk):
         self.dl_queue    = queue.Queue()
         self.queue_items = []          # list of (url, fmt) for display
         self._is_downloading = False
+        self._plan = None              # 지금 입력한 URL의 화질/음질 정보 (FormatPlan)
+        self._info_token = 0           # 오래된 정보 읽기 결과를 무시하기 위한 번호
+        self._info_after = None        # 입력 후 잠깐 기다렸다 읽기 위한 타이머
+        self._last_info_url = None
 
         cleanup_update_leftovers()
         self._update_banner = None     # 현재 떠 있는 업데이트 배너
         self._update_action = None     # 배너의 "지금 업데이트" 동작
         self._build_ui()
         self._build_menu()
+        self._fit_initial_size(w, sh)
         self._start_worker()
         # 앱 시작 3초 후 업데이트 체크 (UI 로딩 방해 안 되게)
         self.after(3000, self._check_update_async)
@@ -382,12 +619,18 @@ class YoutubeDownloader(tk.Tk):
         update_btn.pack(side="right", padx=8)
         self._update_action = on_update
 
+        def close_banner():
+            h = banner.winfo_height()
+            banner.destroy()
+            self._grow_window(-h)
+
         close_btn = make_button(
-            banner, "✕", banner.destroy,
+            banner, "✕", close_banner,
             bg="#2d6a4f", fg="white", abg="#245a41",
             font=(FONT, self._fs(10)), padx=6
         )
         close_btn.pack(side="right")
+        self._grow_window(widget=banner)   # 배너가 다 만들어진 뒤 높이 반영
 
     def _start_self_update(self, url, banner, msg, btn):
         """새 버전을 받아 지금 설치된 위치에 덮어쓰고 재시작"""
@@ -472,6 +715,31 @@ class YoutubeDownloader(tk.Tk):
 
         self._build_content(self._inner)
 
+    def _fit_initial_size(self, w, sh):
+        """처음 켰을 때 스크롤 없이 모든 UI가 보이도록 창 높이를 내용에 맞춘다
+        (화면보다 커지면 화면에 맞추고, 그때부터는 스크롤)"""
+        self.update_idletasks()
+        need = (self._top_bar.winfo_reqheight() + self._inner.winfo_reqheight()
+                + sum(b.winfo_reqheight() for b in self._bottom_widgets))
+        self._max_h = max(400, sh - 140)       # 메뉴바/독 자리
+        h = max(400, min(need + 4, self._max_h))
+        y = max(20, (sh - h) // 2 - 20)
+        self.geometry(f"{w}x{h}+{(self.winfo_screenwidth() - w) // 2}+{y}")
+        self._auto_h = h                        # 사용자가 크기를 바꾸기 전의 자동 높이
+
+    def _grow_window(self, dh=0, widget=None):
+        """업데이트 배너가 생기거나 사라질 때, 사용자가 크기를 안 바꿨다면 창 높이를 같이 조절
+        (widget을 주면 그 위젯이 차지할 높이를 레이아웃이 끝난 뒤 읽는다)"""
+        self.update_idletasks()
+        if widget is not None:
+            dh = widget.winfo_reqheight()
+        cur = self.winfo_height()
+        if abs(cur - self._auto_h) > 2:
+            return
+        new = max(400, min(cur + dh, self._max_h))
+        self.geometry(f"{self.winfo_width()}x{new}")
+        self._auto_h = new
+
     def _on_mousewheel(self, e):
         # Windows는 한 칸에 delta 120, macOS는 이미 작은 정수 단위
         step = int(-1 * (e.delta / 120)) if IS_WIN else -e.delta
@@ -480,10 +748,12 @@ class YoutubeDownloader(tk.Tk):
 
     def _build_progress_panel(self):
         """항상 보이는 하단 고정 패널"""
-        tk.Frame(self, bg=ACCENT, height=4).pack(side="bottom", fill="x")
+        bottom_line = tk.Frame(self, bg=ACCENT, height=4)
+        bottom_line.pack(side="bottom", fill="x")
 
         pf = tk.Frame(self, bg=PANEL, padx=16, pady=10)
         pf.pack(side="bottom", fill="x")
+        self._bottom_widgets = [bottom_line, pf]
 
         # status + percentage row
         row = tk.Frame(pf, bg=PANEL)
@@ -563,6 +833,9 @@ class YoutubeDownloader(tk.Tk):
         self.url_entry.bind("<FocusIn>",  self._url_focus_in)
         self.url_entry.bind("<FocusOut>", self._url_focus_out)
         self.url_entry.bind("<KeyPress>", self._url_key)
+        self.url_entry.bind("<KeyRelease>", self._url_changed)
+        self.url_entry.bind("<<Paste>>", lambda e: self.after(80, self._url_changed))
+        self.url_entry.bind("<<Cut>>", lambda e: self.after(80, self._url_changed))
 
         # ── format buttons ──
         fmt_frame = tk.Frame(parent, bg=BG, padx=pad)
@@ -573,6 +846,13 @@ class YoutubeDownloader(tk.Tk):
             font=(FONT, self._fs(10), "bold"),
             bg=BG, fg=MUTED
         ).pack(anchor="w", pady=4)
+
+        self._info_label = tk.Label(
+            fmt_frame, text="", anchor="nw", justify="left", height=2,
+            font=(FONT, self._fs(9)), bg=BG, fg=MUTED,
+            wraplength=int(620 * self._scale)
+        )
+        self._info_label.pack(fill="x", pady=(0, 4))
 
         self._fmt_btn_frame = tk.Frame(fmt_frame, bg=BG)
         self._fmt_btn_frame.pack(fill="x")
@@ -645,36 +925,105 @@ class YoutubeDownloader(tk.Tk):
             w.destroy()
 
         current = self.format_var.get()
-        per_row = 3
         keys = list(FORMAT_LABELS.keys())
+        # 화질 3개씩 두 줄, 오디오 두 개 한 줄 (같은 줄의 버튼은 너비를 똑같이)
+        rows = [keys[0:3], keys[3:6], keys[6:8]]
 
-        for i, key in enumerate(keys):
-            label = FORMAT_LABELS[key]
-            selected = (key == current)
+        for r, row_keys in enumerate(rows):
+            row_frame = tk.Frame(self._fmt_btn_frame, bg=BG)
+            row_frame.pack(fill="x", pady=2)
+            group = "fmt3" if len(row_keys) == 3 else "fmt2"
+            for c, key in enumerate(row_keys):
+                row_frame.grid_columnconfigure(c, weight=1, uniform=group)
+                enabled, sub = (True, "")
+                if self._plan:
+                    enabled, sub = self._plan.option(key)
+                selected = enabled and (key == current)
 
-            row_idx = i // per_row
-            col_idx = i % per_row
-
-            if col_idx == 0:
-                row_frame = tk.Frame(self._fmt_btn_frame, bg=BG)
-                row_frame.pack(fill="x", pady=2)
-
-            btn_text = ("✔  " + label) if selected else label
-            btn = make_button(
-                row_frame, btn_text,
-                lambda k=key: self._select_format(k),
-                bg=ACCENT if selected else ACCENT2,
-                fg="white" if selected else MUTED,
-                abg=ACCENT,
-                font=(FONT, self._fs(11), "bold" if selected else "normal"),
-                padx=10, pady=8
-            )
-            btn.pack(side="left", padx=3, expand=True, fill="x")
+                text = ("✔  " if selected else "") + FORMAT_LABELS[key]
+                # 영상 정보가 오기 전에도 두 줄 높이를 잡아 둬서, 정보가 와도 레이아웃이 안 변하게
+                text += "\n" + (sub or " ")
+                if not enabled:
+                    bg, fg = "#141b2d", "#4a5468"
+                else:
+                    bg = ACCENT if selected else ACCENT2
+                    fg = "white" if selected else MUTED
+                btn = make_button(
+                    row_frame, text,
+                    lambda k=key: self._select_format(k),
+                    bg=bg, fg=fg, abg=ACCENT, disabled=not enabled,
+                    font=(FONT, self._fs(11), "bold" if selected else "normal"),
+                    padx=10, pady=8
+                )
+                btn.grid(row=0, column=c, sticky="nsew", padx=3)
 
     def _select_format(self, val):
+        if self._plan and not self._plan.option(val)[0]:
+            return
         self.format_var.set(val)
         self._build_format_buttons()
         # URL은 건드리지 않음
+
+    # ── 영상 정보 읽기 (화질/음질/용량) ───────────────────────────────────────────
+    def _url_changed(self, e=None):
+        url = self.url_entry.get().strip()
+        if self._info_after:
+            self.after_cancel(self._info_after)
+            self._info_after = None
+        if not url or url == PLACEHOLDER or not url.lower().startswith("http"):
+            self._reset_plan()
+            return
+        if url == self._last_info_url:
+            return
+        self._info_after = self.after(700, self._fetch_plan_async, url)
+
+    def _reset_plan(self):
+        self._info_token += 1
+        self._last_info_url = None
+        had = self._plan is not None
+        self._plan = None
+        self._info_label.config(text="")
+        if had:
+            self._build_format_buttons()
+
+    def _fetch_plan_async(self, url):
+        self._info_after = None
+        self._last_info_url = url
+        self._info_token += 1
+        token = self._info_token
+        self._info_label.config(text="영상 정보 확인 중...", fg=MUTED)
+
+        def work():
+            plan, title, err = None, "", None
+            try:
+                info = fetch_info(url)
+                title = (info or {}).get("title") or ""
+                plan = plan_from_info(info)
+            except Exception as ex:
+                err = str(ex)
+            self.after(0, self._apply_plan, token, plan, title, err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_plan(self, token, plan, title, err):
+        if token != self._info_token:      # 그 사이 URL이 바뀜
+            return
+        self._plan = plan
+        if plan:
+            dur = _fmt_duration(plan.duration)
+            short = title if len(title) <= 60 else title[:57] + "..."
+            self._info_label.config(
+                text=short + (f"   ·   {dur}" if dur else ""), fg=TEXT
+            )
+            if not plan.option(self.format_var.get())[0]:
+                self.format_var.set("video_best")   # 선택했던 화질이 이 영상에는 없음
+        else:
+            self._info_label.config(
+                text="영상 정보를 읽지 못했습니다. 그래도 다운로드는 시도할 수 있습니다."
+                if err else "재생목록이거나 화질 정보를 알 수 없습니다.",
+                fg=MUTED
+            )
+        self._build_format_buttons()
 
     # ── URL placeholder ───────────────────────────────────────────────────────
     def _url_focus_in(self, e):
@@ -714,6 +1063,7 @@ class YoutubeDownloader(tk.Tk):
         self.url_entry.delete(0, "end")
         self.url_entry.insert(0, PLACEHOLDER)
         self.url_entry.config(fg=MUTED)
+        self._reset_plan()
 
     def _refresh_queue_ui(self):
         for w in self.queue_list_frame.winfo_children():
@@ -799,39 +1149,34 @@ class YoutubeDownloader(tk.Tk):
     # ── download ──────────────────────────────────────────────────────────────
     def _download(self, url, fmt, save_dir):
         ffmpeg = get_ffmpeg_path()
-
-        def make_opts(hls_first):
-            common = {
-                "outtmpl": os.path.join(save_dir, "%(title)s.%(ext)s"),
-                "ffmpeg_location": ffmpeg,
-                "progress_hooks": [self._progress_hook],
-                "retries": 10,
-                "fragment_retries": 10,
-            }
-            if fmt == "mp3":
-                return {
-                    **common,
-                    "format": "bestaudio/best",
-                    "postprocessors": [{
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }],
-                }
-            if fmt == "video_best":
-                limit, tail = "", "bestvideo+bestaudio/best"
-            else:
-                limit = f"[height<={fmt}]"
-                tail = f"bestvideo{limit}+bestaudio/best{limit}/best"
-            # 일부 직접 주소(https) 형식이 간헐적으로 403이 나서, 마지막 재시도에서는 HLS 형식을 먼저 시도
-            fmt_str = f"bestvideo{limit}[protocol^=m3u8]+bestaudio/{tail}" if hls_first else tail
-            return {**common, "format": fmt_str, "merge_output_format": "mp4"}
+        common = {
+            "outtmpl": os.path.join(save_dir, "%(title)s.%(ext)s"),
+            "ffmpeg_location": ffmpeg,
+            "progress_hooks": [self._progress_hook],
+            "retries": 10,
+            "fragment_retries": 10,
+            "noplaylist": True,
+        }
+        js_runtimes = get_js_runtimes()
+        if js_runtimes:
+            common["js_runtimes"] = js_runtimes
 
         # 유튜브가 간헐적으로 403(Forbidden)을 주므로, 새 주소를 받아 다시 시도 → 그래도 안 되면 HLS 형식
         for attempt in range(3):
+            hls_first = (attempt == 2)
             try:
-                with yt_dlp.YoutubeDL(make_opts(hls_first=(attempt == 2))) as ydl:
-                    ydl.download([url])
+                self.after(0, self.status_var.set, "영상 정보 확인 중...")
+                info = fetch_info(url)
+                plan = plan_from_info(info)
+                if plan:
+                    sel, extra = plan.download_spec(fmt, hls_first)
+                else:   # 재생목록 등 정보를 못 읽은 경우는 예전 방식으로
+                    sel, extra = legacy_spec(fmt, hls_first)
+                with yt_dlp.YoutubeDL({**common, "format": sel, **extra}) as ydl:
+                    if plan:
+                        ydl.process_ie_result(info, download=True)   # 위에서 읽은 정보를 재사용
+                    else:
+                        ydl.download([url])
                 return
             except yt_dlp.utils.DownloadError as e:
                 if "403" not in str(e) or attempt == 2:

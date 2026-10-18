@@ -79,7 +79,7 @@ jobs:
       - name: 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install yt-dlp imageio-ffmpeg certifi pyinstaller
+          pip install yt-dlp yt-dlp-ejs imageio-ffmpeg certifi pyinstaller
 
       - name: yt-dlp 실제 설치 버전 확인
         id: ytdlp_ver
@@ -100,6 +100,13 @@ jobs:
           with open('yt_downloader.py', 'w', encoding='utf-8') as f:
               f.write(content)
 
+      - name: QuickJS(유튜브 주소 해독용 JS 런타임) 받기
+        shell: bash
+        run: |
+          mkdir -p bin
+          curl -fsSL -o bin/qjs.exe \
+            https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-windows-x86_64.exe
+
       - name: EXE 빌드
         run: |
           python -m PyInstaller `
@@ -107,7 +114,9 @@ jobs:
             --windowed `
             --name "YoutubeDownloader" `
             --collect-all yt_dlp `
+            --collect-all yt_dlp_ejs `
             --collect-all imageio_ffmpeg `
+            --add-binary "bin/qjs.exe;." `
             yt_downloader.py
 
       - name: 빌드 결과 업로드
@@ -137,7 +146,7 @@ jobs:
       - name: 패키지 설치
         run: |
           python -m pip install --upgrade pip
-          pip install yt-dlp imageio-ffmpeg certifi pyinstaller
+          pip install yt-dlp yt-dlp-ejs imageio-ffmpeg certifi pyinstaller
 
       - name: 소스에 버전 주입
         run: |
@@ -152,6 +161,13 @@ jobs:
               f.write(content)
           EOF
 
+      - name: QuickJS(유튜브 주소 해독용 JS 런타임) 받기
+        run: |
+          mkdir -p bin
+          curl -fsSL -o bin/qjs \
+            https://github.com/quickjs-ng/quickjs/releases/download/v0.17.0/qjs-darwin-arm64
+          chmod +x bin/qjs
+
       - name: 앱 빌드
         run: |
           python -m PyInstaller \
@@ -159,7 +175,9 @@ jobs:
             --name "YoutubeDownloader" \
             --osx-bundle-identifier com.jcha0607.youtubedownloader \
             --collect-all yt_dlp \
+            --collect-all yt_dlp_ejs \
             --collect-all imageio_ffmpeg \
+            --add-binary "bin/qjs:." \
             yt_downloader.py
           # 개발자 인증서가 없으므로 ad-hoc 서명 (Apple Silicon에서 실행에 필요)
           codesign --force --deep --sign - dist/YoutubeDownloader.app
