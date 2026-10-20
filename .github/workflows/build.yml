@@ -37,18 +37,21 @@ jobs:
       - name: yt-dlp 최신 버전 확인
         id: check
         run: |
+          # 버전 표기를 통일 (PyPI는 2026.8.19, 설치된 yt-dlp는 2026.08.19 처럼 0 유무가 달라서 숫자로 정규화)
+          norm() { python3 -c "import sys; print('.'.join(str(int(x)) for x in sys.argv[1].split('.')))" "$1" 2>/dev/null || echo "$1"; }
+
           # PyPI에서 yt-dlp 최신 버전 가져오기
           LATEST=$(curl -s https://pypi.org/pypi/yt-dlp/json | python3 -c "import sys,json; print(json.load(sys.stdin)['info']['version'])")
           echo "최신 yt-dlp 버전: $LATEST"
 
-          # 현재 Release 태그에서 yt-dlp 버전 가져오기
+          # 현재 Release 본문("- yt-dlp: 2026.08.19")에서 yt-dlp 버전 가져오기 (줄의 마지막 단어)
           CURRENT=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('body',''))" \
-            | grep "yt-dlp:" | awk '{print $2}' || echo "none")
+            | grep "yt-dlp:" | awk '{print $NF}' | tr -d '\r' || echo "none")
           echo "현재 빌드의 yt-dlp 버전: $CURRENT"
 
-          if [ "$LATEST" != "$CURRENT" ]; then
+          if [ "$(norm "$LATEST")" != "$(norm "$CURRENT")" ]; then
             echo "새 버전 감지! 빌드 시작"
             echo "should_build=true" >> $GITHUB_OUTPUT
           else

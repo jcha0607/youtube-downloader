@@ -247,6 +247,22 @@ def fetch_info(url, tries=3):
     return best
 
 
+# 다시 시도해도 소용없는 오류 (영상 자체의 문제)
+PERMANENT_ERRORS = (
+    "private video", "sign in to confirm", "members-only", "members only",
+    "copyright", "not available in your country", "geo restrict", "has been removed",
+    "account associated", "has been terminated", "no longer available",
+    "age-restricted", "confirm your age", "premieres in", "live event will begin",
+    "unsupported url", "is not a valid url",
+)
+MAX_TRIES = 5
+
+
+def is_permanent_error(exc):
+    msg = str(exc).lower()
+    return any(k in msg for k in PERMANENT_ERRORS)
+
+
 def plan_from_info(info):
     """읽은 정보로 FormatPlan을 만들 수 없으면(재생목록 등) None"""
     if not info or info.get("_type") == "playlist" or not info.get("formats"):
@@ -512,7 +528,8 @@ class YoutubeDownloader(tk.Tk):
         self.pct_var     = tk.StringVar(value="0%")
 
         self.dl_queue    = queue.Queue()
-        self.queue_items = []          # list of (url, fmt) for display
+        # 대기열 항목: {"url","fmt","save_dir","status": waiting|running|failed,"error"}
+        self.queue_items = []
         self._is_downloading = False
         self._plan = None              # 지금 입력한 URL의 화질/음질 정보 (FormatPlan)
         self._info_token = 0           # 오래된 정보 읽기 결과를 무시하기 위한 번호
@@ -834,7 +851,7 @@ class YoutubeDownloader(tk.Tk):
         self.url_entry.bind("<FocusOut>", self._url_focus_out)
         self.url_entry.bind("<KeyPress>", self._url_key)
         self.url_entry.bind("<KeyRelease>", self._url_changed)
-        self.url_entry.bind("<<Paste>>", lambda e: self.after(80, self._url_changed))
+        self.url_entry.bind("<<Paste>>", self._url_paste)
         self.url_entry.bind("<<Cut>>", lambda e: self.after(80, self._url_changed))
 
         # ── format buttons ──
@@ -1026,18 +1043,36 @@ class YoutubeDownloader(tk.Tk):
         self._build_format_buttons()
 
     # ── URL placeholder ───────────────────────────────────────────────────────
-    def _url_focus_in(self, e):
+    def _clear_placeholder(self):
+        """안내 문구가 진짜 글자처럼 남아 있으면 지운다 (입력/붙여넣기 전에 호출)"""
         if self.url_entry.get() == PLACEHOLDER:
             self.url_entry.delete(0, "end")
-            self.url_entry.config(fg=TEXT)
+        self.url_entry.config(fg=TEXT)
+
+    def _url_focus_in(self, e):
+        self._clear_placeholder()
 
     def _url_focus_out(self, e):
         if not self.url_entry.get().strip():
+            self.url_entry.delete(0, "end")
             self.url_entry.insert(0, PLACEHOLDER)
             self.url_entry.config(fg=MUTED)
 
     def _url_key(self, e):
-        self.url_entry.config(fg=TEXT)
+        self._clear_placeholder()
+
+    def _url_paste(self, e=None):
+        self._clear_placeholder()           # 안내 문구 뒤에 붙지 않고 문구를 대체
+        self.after(80, self._url_changed)
+
+    def _reset_url_entry(self):
+        """입력칸 비우기. 커서가 입력칸에 있으면 비워 두고(바로 붙여넣기 가능), 아니면 안내 문구 표시"""
+        self.url_entry.delete(0, "end")
+        if self.focus_get() is self.url_entry:
+            self.url_entry.config(fg=TEXT)
+        else:
+            self.url_entry.insert(0, PLACEHOLDER)
+            self.url_entry.config(fg=MUTED)
 
     # ── folder ────────────────────────────────────────────────────────────────
     def _choose_folder(self):
@@ -1052,18 +1087,44 @@ class YoutubeDownloader(tk.Tk):
             messagebox.showwarning("URL 없음", "YouTube URL을 입력해주세요.")
             return
 
-        fmt      = self.format_var.get()
-        save_dir = self.save_dir.get()
-
-        self.queue_items.append((url, fmt))
-        self.dl_queue.put((url, fmt, save_dir))
+        item = {
+            "url": url, "fmt": self.format_var.get(), "save_dir": self.save_dir.get(),
+            "status": "waiting", "error": "",
+        }
+        self.queue_items.append(item)
+        self.dl_queue.put(item)
         self._refresh_queue_ui()
 
         # URL 초기화
-        self.url_entry.delete(0, "end")
-        self.url_entry.insert(0, PLACEHOLDER)
-        self.url_entry.config(fg=MUTED)
+        self._reset_url_entry()
         self._reset_plan()
+
+    def _waiting_count(self):
+        return sum(1 for i in list(self.queue_items) if i["status"] == "waiting")
+
+    def _retry_item(self, item):
+        """실패한 항목을 대기열 맨 뒤에 다시 넣는다"""
+        if item not in self.queue_items or item["status"] != "failed":
+            return
+        item["status"], item["error"], item["cancelled"] = "waiting", "", False
+        self.dl_queue.put(item)
+        self._refresh_queue_ui()
+        if not self._is_downloading:
+            self.status_var.set("다시 시도합니다...")
+
+    def _remove_item(self, item):
+        """대기 중이거나 실패한 항목을 대기열에서 지운다 (다운로드 중인 항목은 지울 수 없음)"""
+        if item not in self.queue_items or item["status"] == "running":
+            return
+        item["cancelled"] = True             # 이미 줄 서 있다면 워커가 건너뛴다
+        self.queue_items.remove(item)
+        self._refresh_queue_ui()
+
+    @staticmethod
+    def _short_error(msg, limit=90):
+        line = (msg or "").strip().splitlines()[0] if msg else ""
+        line = line.replace("ERROR: ", "", 1)
+        return line if len(line) <= limit else line[:limit - 3] + "..."
 
     def _refresh_queue_ui(self):
         for w in self.queue_list_frame.winfo_children():
@@ -1081,70 +1142,116 @@ class YoutubeDownloader(tk.Tk):
             ).pack(pady=8)
             return
 
-        for i, (url, fmt) in enumerate(self.queue_items):
+        for i, item in enumerate(self.queue_items):
+            failed = item["status"] == "failed"
             item_frame = tk.Frame(self.queue_list_frame, bg=ACCENT2, pady=6, padx=10)
             item_frame.pack(fill="x", pady=2)
 
-            num_label = tk.Label(
-                item_frame,
-                text=f"{i+1}.",
+            row = tk.Frame(item_frame, bg=ACCENT2)
+            row.pack(fill="x")
+
+            tk.Label(
+                row, text=f"{i+1}.",
                 font=(FONT, self._fs(10), "bold"),
                 bg=ACCENT2, fg=ACCENT, width=3, anchor="w"
-            )
-            num_label.pack(side="left")
+            ).pack(side="left")
 
-            short_url = url if len(url) <= 48 else url[:45] + "..."
+            url = item["url"]
+            short_url = url if len(url) <= 40 else url[:37] + "..."
             tk.Label(
-                item_frame,
-                text=short_url,
+                row, text=short_url,
                 font=(FONT, self._fs(9)),
                 bg=ACCENT2, fg=TEXT, anchor="w"
             ).pack(side="left", fill="x", expand=True)
 
+            # 오른쪽 끝부터: 버튼들, 상태, 형식
+            btn_font = (FONT, self._fs(9), "bold")
+            if item["status"] != "running":
+                make_button(
+                    row, "삭제", lambda it=item: self._remove_item(it),
+                    bg="#5b2a3b", fg="white", abg=ACCENT, font=btn_font, padx=8, pady=2
+                ).pack(side="right", padx=(4, 0))
+            if failed:
+                make_button(
+                    row, "재시도", lambda it=item: self._retry_item(it),
+                    bg=SUCCESS, fg="#1a1a2e", abg="#3aa88a", afg="#1a1a2e",
+                    font=btn_font, padx=8, pady=2
+                ).pack(side="right", padx=(4, 0))
+
+            status_text, status_color = {
+                "running": ("다운로드 중", SUCCESS),
+                "failed": ("실패", "#ff6b6b"),
+            }.get(item["status"], ("", MUTED))
+            if status_text:
+                tk.Label(
+                    row, text=status_text, font=(FONT, self._fs(9), "bold"),
+                    bg=ACCENT2, fg=status_color
+                ).pack(side="right", padx=6)
+
             tk.Label(
-                item_frame,
-                text=FORMAT_LABELS.get(fmt, fmt),
-                font=(FONT, self._fs(9)),
-                bg=ACCENT2, fg=MUTED
-            ).pack(side="right")
+                row, text=FORMAT_LABELS.get(item["fmt"], item["fmt"]),
+                font=(FONT, self._fs(9)), bg=ACCENT2, fg=MUTED
+            ).pack(side="right", padx=6)
+
+            if failed and item["error"]:
+                tk.Label(
+                    item_frame, text="오류: " + self._short_error(item["error"]),
+                    font=(FONT, self._fs(8)), bg=ACCENT2, fg="#ff9b9b",
+                    anchor="w", justify="left", wraplength=int(560 * self._scale)
+                ).pack(fill="x", padx=(28, 0), pady=(3, 0))
 
     # ── worker thread ─────────────────────────────────────────────────────────
     def _start_worker(self):
         def worker():
             while True:
-                url, fmt, save_dir = self.dl_queue.get()
-                self.after(0, self._on_start)
+                item = self.dl_queue.get()
+                if item.get("cancelled") or item["status"] != "waiting":
+                    self.dl_queue.task_done()       # 그 사이 삭제된 항목
+                    continue
+                self.after(0, self._on_start, item)
+                error = None
                 try:
-                    self._download(url, fmt, save_dir)
+                    self._download(item["url"], item["fmt"], item["save_dir"])
                 except Exception as exc:
-                    self.after(0, lambda e=exc: messagebox.showerror(
-                        "다운로드 오류", str(e)
-                    ))
+                    error = str(exc) or exc.__class__.__name__
+                    if not is_permanent_error(exc):
+                        error += f"\n(자동으로 {MAX_TRIES}번 시도했지만 실패했습니다)"
                 finally:
                     self.dl_queue.task_done()
-                    self.after(0, self._on_finish_one, save_dir)
+                    self.after(0, self._on_finish_one, item, error)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_start(self):
+    def _on_start(self, item):
+        item["status"] = "running"
         self._is_downloading = True
         self.progress_var.set(0)
         self.pct_var.set("0%")
         self.status_var.set("다운로드 준비 중...")
-
-    def _on_finish_one(self, save_dir):
-        if self.queue_items:
-            self.queue_items.pop(0)
         self._refresh_queue_ui()
 
-        remaining = self.dl_queue.qsize()
-        if remaining == 0:
+    def _on_finish_one(self, item, error):
+        if error is None:
+            if item in self.queue_items:
+                self.queue_items.remove(item)          # 성공한 항목은 목록에서 뺀다
+        elif item in self.queue_items:
+            item["status"], item["error"] = "failed", error  # 실패한 항목은 남겨 둔다
+        self._refresh_queue_ui()
+
+        waiting = self._waiting_count()
+        if waiting == 0:
             self._is_downloading = False
-            self.progress_var.set(100)
-            self.pct_var.set("완료!")
-            self.status_var.set(f"저장 완료 → {save_dir}")
+            failed = sum(1 for i in self.queue_items if i["status"] == "failed")
+            if failed:
+                self.progress_var.set(0)
+                self.pct_var.set("일부 실패")
+                self.status_var.set(f"실패 {failed}개 — 대기열에서 재시도하거나 삭제할 수 있습니다")
+            else:
+                self.progress_var.set(100)
+                self.pct_var.set("완료!")
+                self.status_var.set(f"저장 완료 → {item['save_dir']}")
         else:
-            self.status_var.set(f"다음 항목 준비 중... (남은 항목: {remaining}개)")
+            self.status_var.set(f"다음 항목 준비 중... (남은 항목: {waiting}개)")
 
     # ── download ──────────────────────────────────────────────────────────────
     def _download(self, url, fmt, save_dir):
@@ -1161,9 +1268,10 @@ class YoutubeDownloader(tk.Tk):
         if js_runtimes:
             common["js_runtimes"] = js_runtimes
 
-        # 유튜브가 간헐적으로 403(Forbidden)을 주므로, 새 주소를 받아 다시 시도 → 그래도 안 되면 HLS 형식
-        for attempt in range(3):
-            hls_first = (attempt == 2)
+        # 다운로드 중 오류(네트워크 끊김, 403 등)가 나면 자동으로 다시 시도한다.
+        # 새 주소를 받아 이어받기(받던 부분부터)로 재개하고, 3·5번째 시도에서는 HLS 형식을 먼저 시도
+        for attempt in range(MAX_TRIES):
+            hls_first = attempt >= 2 and attempt % 2 == 0
             try:
                 self.after(0, self.status_var.set, "영상 정보 확인 중...")
                 info = fetch_info(url)
@@ -1178,10 +1286,12 @@ class YoutubeDownloader(tk.Tk):
                     else:
                         ydl.download([url])
                 return
-            except yt_dlp.utils.DownloadError as e:
-                if "403" not in str(e) or attempt == 2:
+            except Exception as e:
+                if attempt == MAX_TRIES - 1 or is_permanent_error(e):
                     raise
-                self.after(0, self.status_var.set, "접근이 거부되어 다시 시도하는 중...")
+                self.after(0, self.status_var.set,
+                           f"오류가 발생해 다시 시도하는 중... ({attempt + 2}/{MAX_TRIES})")
+                time.sleep(min(3 * (attempt + 1), 10))
 
     def _progress_hook(self, d):
         if d["status"] == "downloading":
@@ -1200,7 +1310,7 @@ class YoutubeDownloader(tk.Tk):
             dl_mb   = downloaded / 1024 / 1024
             sp_str  = f"{speed/1024/1024:.1f} MB/s" if speed else ""
             eta_str = f"  남은 시간: {eta}초" if eta else ""
-            q_remaining = self.dl_queue.qsize()
+            q_remaining = self._waiting_count()
             q_str = f"  |  대기: {q_remaining}개" if q_remaining else ""
 
             status = f"{dl_mb:.1f} MB  {sp_str}{eta_str}{q_str}"
