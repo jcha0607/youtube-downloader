@@ -8,7 +8,7 @@ on:
     - cron: '0 9 * * *'  # 매일 오전 9시(UTC) 체크
 
 env:
-  VERSION_BASE: "1.0"  # 큰 변경 때 직접 올리세요 (예: 1.1). 뒤의 번호는 빌드마다 자동 증가
+  VERSION_BASE: "1.0"  # 큰 변경 때 직접 올리세요 (예: 1.1). 뒤의 번호는 릴리스마다 1씩 자동 증가
 
 jobs:
   check-and-build:
@@ -19,6 +19,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       version: ${{ steps.ver.outputs.version }}
+      prev_tag: ${{ steps.ver.outputs.prev_tag }}
       ytdlp_version: ${{ steps.check.outputs.ytdlp_version }}
 
     steps:
@@ -30,9 +31,17 @@ jobs:
           gh api -X PUT \
             "repos/${{ github.repository }}/actions/workflows/build.yml/enable"
 
-      - name: 앱 버전 번호 생성 (기준값.빌드번호)
+      - name: 앱 버전 번호 생성 (기준값.마지막 릴리스 번호+1)
         id: ver
-        run: echo "version=${VERSION_BASE}.${{ github.run_number }}" >> $GITHUB_OUTPUT
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PREV=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name 2>/dev/null || echo "")
+          # 마지막 릴리스가 v1.0.42 이면 N=42, 기준값이 달라졌거나 릴리스가 없으면 N=0
+          N=$(PREV="$PREV" BASE="$VERSION_BASE" python3 -c "import os,re; m=re.fullmatch(re.escape('v'+os.environ['BASE'])+r'\.(\d+)', os.environ['PREV']); print(m.group(1) if m else 0)")
+          echo "이전 릴리스: '$PREV' → 이번 버전: ${VERSION_BASE}.$((N+1))"
+          echo "version=${VERSION_BASE}.$((N+1))" >> $GITHUB_OUTPUT
+          echo "prev_tag=$PREV" >> $GITHUB_OUTPUT
 
       - name: yt-dlp 최신 버전 확인
         id: check
@@ -48,7 +57,7 @@ jobs:
           CURRENT=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/latest \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('body',''))" \
-            | grep "yt-dlp:" | awk '{print $NF}' | tr -d '\r' || echo "none")
+            | grep -E '^- yt-dlp: [0-9.]+$' | head -1 | awk '{print $NF}' | tr -d '\r' || echo "none")
           echo "현재 빌드의 yt-dlp 버전: $CURRENT"
 
           if [ "$(norm "$LATEST")" != "$(norm "$CURRENT")" ]; then
@@ -207,29 +216,39 @@ jobs:
       contents: write
 
     steps:
+      - name: 코드 체크아웃 (변경 내용 작성용)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: 빌드 결과 받기
         uses: actions/download-artifact@v4
         with:
           path: out
           merge-multiple: true
 
+      - name: 릴리스 설명 작성 (이번에 바뀐 내용)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.check-and-build.outputs.version }}
+          PREV_TAG: ${{ needs.check-and-build.outputs.prev_tag }}
+          YTDLP_NEW: ${{ needs.build-windows.outputs.ytdlp_version }}
+        run: |
+          YTDLP_OLD=""
+          if [ -n "$PREV_TAG" ]; then
+            YTDLP_OLD=$(gh release view "$PREV_TAG" --json body --jq .body \
+              | grep -E '^- yt-dlp: [0-9.]+$' | head -1 | awk '{print $NF}' | tr -d '\r' || true)
+          fi
+          export YTDLP_OLD
+          python3 .github/scripts/release_notes.py > notes.md
+          cat notes.md
+
       - name: GitHub Release 생성
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ needs.check-and-build.outputs.version }}
           name: "유튜브 다운로더 v${{ needs.check-and-build.outputs.version }}"
-          body: |
-            ## 다운로드
-            - **Windows**: `YoutubeDownloader.exe`
-            - **Mac (Apple Silicon)**: `YoutubeDownloader.dmg` 를 열어 앱을 Applications 폴더로 끌어다 놓으세요.
-
-            ### Mac 처음 실행 시
-            개발자 인증서로 서명된 앱이 아니라서 처음 한 번은 "열 수 없음" 경고가 뜹니다.
-            앱을 **우클릭 → 열기**를 하거나, 시스템 설정 → 개인정보 보호 및 보안에서 **그래도 열기**를 누르세요.
-            이후 업데이트는 앱 안의 "지금 업데이트" 버튼으로 자동 교체되어 이 과정이 필요 없습니다.
-
-            ## 버전 정보
-            - yt-dlp: ${{ needs.build-windows.outputs.ytdlp_version }}
+          body_path: notes.md
           files: |
             out/YoutubeDownloader.exe
             out/YoutubeDownloader.dmg
